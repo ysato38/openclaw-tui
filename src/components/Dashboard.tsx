@@ -3,6 +3,7 @@ import { Box, Text } from 'ink';
 import { DashboardState } from '../core/types.js';
 import { ThemeName, getTheme } from '../theme/themes.js';
 import { Panel } from './Panel.js';
+import { QuoteWidget } from './QuoteWidget.js';
 
 type Props = { state: DashboardState; themeName: ThemeName; focusIndex: number; commandMode: boolean; commandText: string };
 
@@ -18,6 +19,8 @@ export const Dashboard: React.FC<Props> = ({ state, themeName, focusIndex, comma
         <Text color={theme.title}>⚡ OPENCLAW MISSION CONTROL [{theme.name}]</Text>
         <Text>  {state.now}</Text>
       </Box>
+
+      <QuoteWidget theme={theme} />
 
       <Box>
         <Box flexDirection="column" width="35%">
