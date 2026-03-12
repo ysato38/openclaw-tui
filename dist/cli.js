@@ -251,9 +251,188 @@ var nextState = (prev) => {
 };
 var initialState = base;
 
+// src/pulse/alerts.ts
+var ago = (sec) => {
+  if (!Number.isFinite(sec)) return "unknown";
+  if (sec < 60) return `${sec}s ago`;
+  const m = Math.floor(sec / 60);
+  if (m < 60) return `${m}m ago`;
+  return `${Math.floor(m / 60)}h ago`;
+};
+var evaluateAlerts = (s) => {
+  const out = [];
+  if (!s.gateway.up) {
+    out.push({
+      id: "gateway-down",
+      severity: "critical",
+      title: "Gateway is DOWN",
+      detail: `${s.gateway.host}:${s.gateway.port} not reachable`,
+      bell: true
+    });
+  }
+  if (s.resources.cpuPercent >= 90) {
+    out.push({ id: "cpu-hot", severity: "warn", title: `High CPU ${s.resources.cpuPercent}%` });
+  }
+  if (s.resources.memPercent >= 90) {
+    out.push({ id: "mem-hot", severity: "warn", title: `High MEM ${s.resources.memPercent}%` });
+  }
+  if (s.resources.diskPercent >= 90) {
+    out.push({
+      id: "disk-critical",
+      severity: "critical",
+      title: `Disk critical ${s.resources.diskPercent}%`,
+      bell: true
+    });
+  } else if (s.resources.diskPercent >= 80) {
+    out.push({ id: "disk-warn", severity: "warn", title: `Disk high ${s.resources.diskPercent}%` });
+  }
+  s.agents.filter((a) => !a.online).forEach((a) => {
+    out.push({
+      id: `agent-offline-${a.name}`,
+      severity: "warn",
+      title: `Agent offline: ${a.name}`,
+      detail: `last heartbeat ${ago(a.heartbeatSecAgo)}`
+    });
+  });
+  if (s.logs.oversizedFiles.length > 0) {
+    out.push({
+      id: "logs-oversized",
+      severity: "warn",
+      title: `Large log files detected (${s.logs.oversizedFiles.length})`,
+      detail: s.logs.oversizedFiles.slice(0, 2).map((f) => `${f.path.split("/").pop()} ${f.sizeMb}MB`).join(", ")
+    });
+  }
+  return out;
+};
+var applyAlerts = (s) => ({
+  ...s,
+  alerts: evaluateAlerts(s)
+});
+
+// src/pulse/monitor.ts
+import fs from "fs";
+import os from "os";
+import path from "path";
+import net from "net";
+import { execSync } from "child_process";
+var clamp = (v, min = 0, max = 100) => Math.max(min, Math.min(max, v));
+var readResources = (tokensToday = "N/A") => {
+  const [l1] = os.loadavg();
+  const cpuPercent = clamp(Math.round(l1 / Math.max(os.cpus().length, 1) * 100));
+  const total = os.totalmem();
+  const free = os.freemem();
+  const memPercent = clamp(Math.round((total - free) / total * 100));
+  let diskPercent = 0;
+  try {
+    const out = execSync("df -k / | tail -1", { encoding: "utf-8" }).trim();
+    const cols = out.split(/\s+/);
+    const cap = cols[4]?.replace("%", "");
+    diskPercent = clamp(Number(cap || 0));
+  } catch {
+    diskPercent = 0;
+  }
+  return { cpuPercent, memPercent, diskPercent, tokensToday };
+};
+var checkGateway = async (host = "127.0.0.1", port = 18789, timeoutMs = 800) => {
+  const checkedAt = (/* @__PURE__ */ new Date()).toISOString();
+  const up = await new Promise((resolve) => {
+    const socket = new net.Socket();
+    let done = false;
+    const close = (ok) => {
+      if (done) return;
+      done = true;
+      socket.destroy();
+      resolve(ok);
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", () => close(true));
+    socket.once("timeout", () => close(false));
+    socket.once("error", () => close(false));
+    socket.connect(port, host);
+  });
+  return { up, host, port, checkedAt };
+};
+var readAgentHeartbeats = (openclawHome = path.join(os.homedir(), ".openclaw"), agentNames = ["main", "dev", "intel", "philo", "pulse"]) => {
+  const now = Date.now();
+  return agentNames.map((name) => {
+    const p = path.join(openclawHome, "agents", name, "sessions", "sessions.json");
+    try {
+      const st = fs.statSync(p);
+      const ageSec = Math.max(0, Math.floor((now - st.mtimeMs) / 1e3));
+      return {
+        name,
+        online: ageSec < 7200,
+        heartbeatSecAgo: ageSec,
+        lastUpdatedAt: new Date(st.mtimeMs).toISOString()
+      };
+    } catch {
+      return {
+        name,
+        online: false,
+        heartbeatSecAgo: Number.POSITIVE_INFINITY
+      };
+    }
+  });
+};
+var listFiles = (dir) => {
+  try {
+    return fs.readdirSync(dir).map((f) => path.join(dir, f));
+  } catch {
+    return [];
+  }
+};
+var readLogRotationStatus = (openclawHome = path.join(os.homedir(), ".openclaw"), warnMb = 100) => {
+  const logDir = path.join(openclawHome, "logs");
+  const files = listFiles(logDir);
+  let totalBytes = 0;
+  const oversized = [];
+  for (const f of files) {
+    try {
+      const st = fs.statSync(f);
+      if (!st.isFile()) continue;
+      totalBytes += st.size;
+      const sizeMb = st.size / (1024 * 1024);
+      if (sizeMb >= warnMb) oversized.push({ path: f, sizeMb: Number(sizeMb.toFixed(1)) });
+    } catch {
+    }
+  }
+  return {
+    oversizedFiles: oversized.sort((a, b) => b.sizeMb - a.sizeMb),
+    totalLogMb: Number((totalBytes / (1024 * 1024)).toFixed(1))
+  };
+};
+var pushDiskTrend = (prev, diskPercent, size = 30) => {
+  const point = { ts: (/* @__PURE__ */ new Date()).toTimeString().slice(0, 8), diskPercent };
+  return [...prev, point].slice(-size);
+};
+var collectMonitoringSnapshot = async (prevTrend = [], opts = {}) => {
+  const resources = readResources(opts.tokensToday ?? "N/A");
+  const gateway = await checkGateway(opts.gatewayHost, opts.gatewayPort);
+  const agents = readAgentHeartbeats(opts.openclawHome, opts.agentNames);
+  const logs = readLogRotationStatus(opts.openclawHome, opts.logWarnMb);
+  const diskTrend = pushDiskTrend(prevTrend, resources.diskPercent, opts.diskTrendSize ?? 30);
+  return {
+    now: (/* @__PURE__ */ new Date()).toISOString(),
+    resources,
+    gateway,
+    agents,
+    logs,
+    diskTrend,
+    alerts: []
+  };
+};
+
 // src/App.tsx
 import { jsx as jsx4 } from "react/jsx-runtime";
 var MAX_PANELS = 5;
+var appendActivity = (s, agent, message) => ({
+  ...s,
+  activity: [{ ts: (/* @__PURE__ */ new Date()).toTimeString().slice(0, 5), agent, message }, ...s.activity].slice(0, 8)
+});
+var parseCommand = (raw) => {
+  const [cmd = "", ...args] = raw.trim().split(/\s+/);
+  return { cmd: cmd.toLowerCase(), args };
+};
 var App = () => {
   const { exit } = useApp();
   const [state, setState] = useState2(initialState);
@@ -266,10 +445,68 @@ var App = () => {
     const id = setInterval(() => setState((s) => nextState(s)), 1e3);
     return () => clearInterval(id);
   }, []);
+  useEffect(() => {
+    let active = true;
+    let trend = [];
+    const tick = async () => {
+      try {
+        const snapshot = applyAlerts(await collectMonitoringSnapshot(trend, { tokensToday: state.health.tokensToday }));
+        trend = snapshot.diskTrend;
+        if (!active) return;
+        setState((s) => ({
+          ...s,
+          agents: s.agents.map((a) => {
+            const hb = snapshot.agents.find((x) => x.name === a.name);
+            return hb ? { ...a, online: hb.online, heartbeatSecAgo: Number.isFinite(hb.heartbeatSecAgo) ? hb.heartbeatSecAgo : a.heartbeatSecAgo } : a;
+          }),
+          health: {
+            ...s.health,
+            cpu: snapshot.resources.cpuPercent,
+            mem: snapshot.resources.memPercent,
+            dsk: snapshot.resources.diskPercent,
+            gatewayUp: snapshot.gateway.up
+          }
+        }));
+      } catch {
+      }
+    };
+    const id = setInterval(() => {
+      void tick();
+    }, 3e3);
+    void tick();
+    return () => {
+      active = false;
+      clearInterval(id);
+    };
+  }, [state.health.tokensToday]);
   useInput((input, key) => {
     if (key.ctrl && input === "c") return exit();
     if (commandMode) {
       if (key.return) {
+        const raw = commandText;
+        const { cmd, args } = parseCommand(raw);
+        if (cmd === "quit" || cmd === "q") {
+          return exit();
+        }
+        if (cmd === "theme" && args[0]) {
+          const t = args[0].toLowerCase();
+          if (t === "cyberpunk" || t === "retro" || t === "minimal") {
+            setTheme(t);
+            setState((s) => appendActivity(s, "system", `theme -> ${t}`));
+          } else {
+            setState((s) => appendActivity(s, "system", `unknown theme: ${args[0]}`));
+          }
+        } else if (cmd === "help") {
+          setState((s) => appendActivity(s, "system", "commands: :theme <cyberpunk|retro|minimal>, :focus <0-4>, :quit"));
+        } else if (cmd === "focus" && args[0]) {
+          const idx = Number(args[0]);
+          if (Number.isInteger(idx) && idx >= 0 && idx < MAX_PANELS) {
+            setFocus(idx);
+            setState((s) => appendActivity(s, "system", `focus -> ${idx}`));
+          }
+        } else if (raw.trim() !== "") {
+          setState((s) => appendActivity(s, "system", `unknown command: ${raw.trim()}`));
+        }
         setCommandMode(false);
         setCommandText("");
         return;
@@ -289,14 +526,16 @@ var App = () => {
     if (input === "q") return exit();
     if (input === ":") return setCommandMode(true);
     if (input === "t") return setTheme((t) => nextTheme(t));
-    if (key.tab) return setFocus((f) => (f + 1) % MAX_PANELS);
     if (key.shift && key.tab) return setFocus((f) => (f - 1 + MAX_PANELS) % MAX_PANELS);
+    if (key.tab) return setFocus((f) => (f + 1) % MAX_PANELS);
     if (input === "h" || input === "k") return setFocus((f) => (f - 1 + MAX_PANELS) % MAX_PANELS);
     if (input === "j" || input === "l") return setFocus((f) => (f + 1) % MAX_PANELS);
-    const next = (konamiBuffer + input).slice(-10);
+    const keyToken = key.upArrow ? "U" : key.downArrow ? "D" : key.leftArrow ? "L" : key.rightArrow ? "R" : input.toLowerCase();
+    const next = (konamiBuffer + keyToken).slice(-10);
     setKonamiBuffer(next);
-    if (next.includes("uuddlrlrba")) {
-      setState((s) => ({ ...s, activity: [{ ts: (/* @__PURE__ */ new Date()).toTimeString().slice(0, 5), agent: "system", message: "\u{1F389} Konami unlocked: Mission Deep Space" }, ...s.activity].slice(0, 8) }));
+    if (next === "UUDDLRLRBA") {
+      setState((s) => appendActivity(s, "system", "\u{1F389} Konami unlocked: Mission Deep Space"));
+      process.stdout.write("\x07");
     }
   });
   return /* @__PURE__ */ jsx4(Dashboard, { state, themeName: theme, focusIndex: focus, commandMode, commandText });
