@@ -5,6 +5,7 @@ import net from 'node:net';
 import { execSync } from 'node:child_process';
 import { AgentHeartbeat, DiskTrendPoint, GatewayStatus, LogRotationStatus, MonitoringSnapshot, ResourceSnapshot } from './types.js';
 
+// Pulse monitoring collector for Mission Control TUI
 export type MonitorOptions = {
   gatewayHost?: string;
   gatewayPort?: number;
