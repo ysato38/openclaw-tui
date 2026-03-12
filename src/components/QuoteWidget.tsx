@@ -11,7 +11,13 @@ type Quote = {
   category: QuoteCategory;
 };
 
-const QUOTES = quotes as Quote[];
+const FALLBACK_QUOTE: Quote = {
+  text: '静かに続けることが、いちばん強い。',
+  author: 'OpenClaw',
+  category: 'focus'
+};
+
+const QUOTES = (quotes as Quote[]).length > 0 ? (quotes as Quote[]) : [FALLBACK_QUOTE];
 const REFRESH_MS = 60_000;
 
 type Props = {
