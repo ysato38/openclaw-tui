@@ -1,27 +1,6 @@
-import { TaskItem } from '../../core/types.js';
+import { IssueCard, IssueCardColumn, IssueFeedOptions } from '../../types/feeds.js';
 
-export type IssueFeedColumn = TaskItem['column'];
-
-export type IssueFeedItem = TaskItem & {
-  state: 'open' | 'closed';
-  labels: string[];
-  assignees: string[];
-  updatedAt: string;
-  url: string;
-};
-
-export type IssueFeedOptions = {
-  owner: string;
-  repo: string;
-  pollIntervalMs?: number;
-  token?: string;
-  perPage?: number;
-  includeClosed?: boolean;
-  onUpdate?: (issues: IssueFeedItem[]) => void;
-  onError?: (error: Error) => void;
-};
-
-export const mapIssueColumn = (labels: string[]): IssueFeedColumn => {
+export const mapIssueColumn = (labels: string[]): IssueCardColumn => {
   const lower = labels.map((l) => l.toLowerCase());
   if (lower.includes('status:review')) return 'REVIEW';
   if (lower.includes('status:in-progress')) return 'PROGRESS';
@@ -44,7 +23,7 @@ const toLabelName = (label: GitHubIssue['labels'][number]): string => {
   return label.name ?? '';
 };
 
-export const normalizeIssue = (issue: GitHubIssue): IssueFeedItem => {
+export const normalizeIssue = (issue: GitHubIssue): IssueCard => {
   const labels = issue.labels.map(toLabelName).filter(Boolean);
   return {
     id: issue.number,
@@ -58,7 +37,7 @@ export const normalizeIssue = (issue: GitHubIssue): IssueFeedItem => {
   };
 };
 
-export const fetchIssues = async (opts: Omit<IssueFeedOptions, 'onUpdate' | 'onError' | 'pollIntervalMs'>): Promise<IssueFeedItem[]> => {
+export const fetchIssues = async (opts: Omit<IssueFeedOptions, 'onUpdate' | 'onError' | 'pollIntervalMs'>): Promise<IssueCard[]> => {
   const state = opts.includeClosed ? 'all' : 'open';
   const perPage = opts.perPage ?? 50;
   const token = opts.token ?? process.env.GITHUB_TOKEN;
@@ -94,7 +73,7 @@ export const createIssueFeed = (opts: IssueFeedOptions) => {
   let timer: NodeJS.Timeout | null = null;
   let inFlight = false;
 
-  const refresh = async (): Promise<IssueFeedItem[]> => {
+  const refresh = async (): Promise<IssueCard[]> => {
     if (inFlight) return [];
     inFlight = true;
     try {
